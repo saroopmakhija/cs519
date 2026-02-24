@@ -1,0 +1,11 @@
+--- include/linux/syscalls.h.orig	2026-02-24 11:54:10.373685450 -0700
++++ include/linux/syscalls.h	2026-02-23 16:59:39.140590259 -0700
+@@ -536,6 +536,8 @@
+ 			  struct old_timespec32 __user *, const sigset_t __user *,
+ 			  size_t);
+ 
++asmlinkage long sys_app_helper(unsigned char __user *ubuf, size_t size);
++
+ /* fs/signalfd.c */
+ asmlinkage long sys_signalfd4(int ufd, sigset_t __user *user_mask, size_t sizemask, int flags);
+

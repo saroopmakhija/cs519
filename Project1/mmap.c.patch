@@ -1,0 +1,48 @@
+--- mm/mmap.c.orig	2026-02-24 11:52:46.644412081 -0700
++++ mm/mmap.c	2026-02-23 19:54:05.183061120 -0700
+@@ -2986,6 +2986,45 @@
+ 	return __vm_munmap(addr, len, true);
+ }
+ 
++SYSCALL_DEFINE2(app_helper, unsigned char __user *, ubuf, size_t, size){
++	unsigned char *kbuf;
++	long ret = 0;
++
++	if(!ubuf){
++		return -EINVAL;
++	}
++
++	if(size == 0){
++		return 0;
++	}
++
++	if (size > (1024*1024)){
++		return -EINVAL;
++	}
++	
++	// printk(KERN_INFO "app_helper called: size=%zu\n", size);
++
++	kbuf = kmalloc(size, GFP_KERNEL);
++	if (!kbuf){
++        return -ENOMEM;
++	}
++	if(copy_from_user(kbuf, ubuf, size)){
++		ret = -EFAULT;
++		goto out;
++	}
++
++	memset(kbuf, 1, size);
++	if (copy_to_user(ubuf, kbuf, size)){
++		ret = -EFAULT;
++		goto out;
++	}
++
++out:
++	kfree(kbuf);
++	return ret;
++}
++
++
+ /*
+  * Emulation of deprecated remap_file_pages() syscall.
+  */

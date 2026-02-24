@@ -1,0 +1,11 @@
+--- arch/x86/entry/syscalls/syscall_64.tbl.orig	2026-02-24 11:53:47.817342779 -0700
++++ arch/x86/entry/syscalls/syscall_64.tbl	2026-02-23 19:59:32.852776778 -0700
+@@ -414,4 +414,5 @@
+ 546	x32	preadv2			compat_sys_preadv64v2
+ 547	x32	pwritev2		compat_sys_pwritev64v2
+ # This is the end of the legacy x32 range.  Numbers 548 and above are
+-# not special and are not to be used for x32-specific syscalls.
+\ No newline at end of file
++# not special and are not to be used for x32-specific syscalls.
++548    common    app_helper    sys_app_helper
+\ No newline at end of file
