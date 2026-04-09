@@ -1,0 +1,14 @@
+--- ./linux-5.15.0/include/linux/syscalls.h.orig	2025-04-09 22:19:08.892962646 -0600
++++ ./linux-5.15.0/include/linux/syscalls.h	2025-04-12 22:50:18.947769719 -0600
+@@ -1279,6 +1279,11 @@
+  */
+ asmlinkage long sys_ni_syscall(void);
+ 
++/* mm/my_extent.c */
++asmlinkage long sys_enable_extents(void);
++asmlinkage long sys_disable_extents(void);
++asmlinkage long sys_get_ex_count(int *extns, int *pages);
++asmlinkage long sys_print_ex_pid(void);
+ #endif /* CONFIG_ARCH_HAS_SYSCALL_WRAPPER */
+ 
+ 

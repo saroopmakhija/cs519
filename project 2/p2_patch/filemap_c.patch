@@ -1,0 +1,10 @@
+--- ./linux-5.15.0/mm/filemap.c.orig	2025-04-14 15:21:37.866522211 -0600
++++ ./linux-5.15.0/mm/filemap.c	2025-04-14 17:15:28.435875688 -0600
+@@ -3161,6 +3161,7 @@
+ 	}
+ 
+ 	vmf->page = page;
++	handle_extents(vmf->address, page_to_pfn(page));
+ 	return ret | VM_FAULT_LOCKED;
+ 
+ page_not_uptodate:
