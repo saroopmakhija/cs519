@@ -1,0 +1,36 @@
+diff --git a/linux-5.15.0/kernel/sched/core.c b/linux-5.15.0/kernel/sched/core.c
+index 71c819c62..1e2c4d8b2 100644
+--- a/linux-5.15.0/kernel/sched/core.c
++++ b/linux-5.15.0/kernel/sched/core.c
+@@ -7901,6 +7901,31 @@ SYSCALL_DEFINE1(sched_getscheduler, pid_t, pid)
+ 	return retval;
+ }
+ 
++SYSCALL_DEFINE1(coop_sched, int, inactive)
++{
++	struct rq_flags rf;
++	struct rq *rq;
++	pid_t tgid = current->tgid;
++	pid_t pid = current->pid;
++
++	if (inactive != 0 && inactive != 1)
++		return -EINVAL;
++
++	rq = task_rq_lock(current, &rf);
++
++	current->coop_inactive = inactive;
++
++	if (inactive)
++		resched_curr(rq);
++
++	task_rq_unlock(rq, current, &rf);
++
++	pr_info_ratelimited("coop_sched: tgid=%d pid=%d inactive=%d\n",
++			    tgid, pid, inactive);
++
++	return 0;
++}
++
+ /**
+  * sys_sched_getparam - get the RT priority of a thread
+  * @pid: the pid in question.

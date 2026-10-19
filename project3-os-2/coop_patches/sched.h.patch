@@ -1,0 +1,13 @@
+diff --git a/linux-5.15.0/include/linux/sched.h b/linux-5.15.0/include/linux/sched.h
+index cbf69d0d6..3f1bf8467 100644
+--- a/linux-5.15.0/include/linux/sched.h
++++ b/linux-5.15.0/include/linux/sched.h
+@@ -763,7 +763,7 @@ struct task_struct {
+ 	int				wake_cpu;
+ #endif
+ 	int				on_rq;
+-
++	int 			coop_inactive;
+ 	int				prio;
+ 	int				static_prio;
+ 	int				normal_prio;

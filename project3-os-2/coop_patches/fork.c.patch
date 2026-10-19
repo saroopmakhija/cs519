@@ -1,0 +1,12 @@
+diff --git a/linux-5.15.0/kernel/fork.c b/linux-5.15.0/kernel/fork.c
+index 442e4562f..9d127ff89 100644
+--- a/linux-5.15.0/kernel/fork.c
++++ b/linux-5.15.0/kernel/fork.c
+@@ -2130,6 +2130,7 @@ static __latent_entropy struct task_struct *copy_process(
+ 	p = dup_task_struct(current, node);
+ 	if (!p)
+ 		goto fork_out;
++	p->coop_inactive = 0;
+ 	if (args->io_thread) {
+ 		/*
+ 		 * Mark us an IO worker, and block any signal that isn't

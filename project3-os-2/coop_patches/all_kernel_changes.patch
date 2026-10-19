@@ -1,0 +1,166 @@
+diff --git a/linux-5.15.0/arch/x86/entry/syscalls/syscall_64.tbl b/linux-5.15.0/arch/x86/entry/syscalls/syscall_64.tbl
+index 18b5500ea..6af59233b 100644
+--- a/linux-5.15.0/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/linux-5.15.0/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -370,7 +370,7 @@
+ 446	common	landlock_restrict_self	sys_landlock_restrict_self
+ 447	common	memfd_secret		sys_memfd_secret
+ 448	common	process_mrelease	sys_process_mrelease
+-
++449	common	coop_sched		sys_coop_sched
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+ # in x32 as compared to native x86_64.  These syscalls have numbers 512-547.
+diff --git a/linux-5.15.0/include/linux/sched.h b/linux-5.15.0/include/linux/sched.h
+index cbf69d0d6..3f1bf8467 100644
+--- a/linux-5.15.0/include/linux/sched.h
++++ b/linux-5.15.0/include/linux/sched.h
+@@ -763,7 +763,7 @@ struct task_struct {
+ 	int				wake_cpu;
+ #endif
+ 	int				on_rq;
+-
++	int 			coop_inactive;
+ 	int				prio;
+ 	int				static_prio;
+ 	int				normal_prio;
+diff --git a/linux-5.15.0/include/linux/syscalls.h b/linux-5.15.0/include/linux/syscalls.h
+index b8037a46f..6be89912c 100644
+--- a/linux-5.15.0/include/linux/syscalls.h
++++ b/linux-5.15.0/include/linux/syscalls.h
+@@ -702,6 +702,8 @@ asmlinkage long sys_sched_setaffinity(pid_t pid, unsigned int len,
+ asmlinkage long sys_sched_getaffinity(pid_t pid, unsigned int len,
+ 					unsigned long __user *user_mask_ptr);
+ asmlinkage long sys_sched_yield(void);
++/* my cooperative scheduler syscall*/
++asmlinkage long sys_coop_sched(int inactive);
+ asmlinkage long sys_sched_get_priority_max(int policy);
+ asmlinkage long sys_sched_get_priority_min(int policy);
+ asmlinkage long sys_sched_rr_get_interval(pid_t pid,
+diff --git a/linux-5.15.0/kernel/fork.c b/linux-5.15.0/kernel/fork.c
+index 442e4562f..9d127ff89 100644
+--- a/linux-5.15.0/kernel/fork.c
++++ b/linux-5.15.0/kernel/fork.c
+@@ -2130,6 +2130,7 @@ static __latent_entropy struct task_struct *copy_process(
+ 	p = dup_task_struct(current, node);
+ 	if (!p)
+ 		goto fork_out;
++	p->coop_inactive = 0;
+ 	if (args->io_thread) {
+ 		/*
+ 		 * Mark us an IO worker, and block any signal that isn't
+diff --git a/linux-5.15.0/kernel/sched/core.c b/linux-5.15.0/kernel/sched/core.c
+index 71c819c62..1e2c4d8b2 100644
+--- a/linux-5.15.0/kernel/sched/core.c
++++ b/linux-5.15.0/kernel/sched/core.c
+@@ -7901,6 +7901,31 @@ SYSCALL_DEFINE1(sched_getscheduler, pid_t, pid)
+ 	return retval;
+ }
+ 
++SYSCALL_DEFINE1(coop_sched, int, inactive)
++{
++	struct rq_flags rf;
++	struct rq *rq;
++	pid_t tgid = current->tgid;
++	pid_t pid = current->pid;
++
++	if (inactive != 0 && inactive != 1)
++		return -EINVAL;
++
++	rq = task_rq_lock(current, &rf);
++
++	current->coop_inactive = inactive;
++
++	if (inactive)
++		resched_curr(rq);
++
++	task_rq_unlock(rq, current, &rf);
++
++	pr_info_ratelimited("coop_sched: tgid=%d pid=%d inactive=%d\n",
++			    tgid, pid, inactive);
++
++	return 0;
++}
++
+ /**
+  * sys_sched_getparam - get the RT priority of a thread
+  * @pid: the pid in question.
+diff --git a/linux-5.15.0/kernel/sched/fair.c b/linux-5.15.0/kernel/sched/fair.c
+index 3a35bd128..4f3e27cbe 100644
+--- a/linux-5.15.0/kernel/sched/fair.c
++++ b/linux-5.15.0/kernel/sched/fair.c
+@@ -63,7 +63,7 @@ static unsigned int normalized_sysctl_sched_min_granularity	= 750000ULL;
+  * This value is kept at sysctl_sched_latency/sysctl_sched_min_granularity
+  */
+ static unsigned int sched_nr_latency = 8;
+-
++#define COOP_STARVE_GRAN_NS 50000000LL /* 50 ms */ 
+ /*
+  * After fork, child runs first. If set to 0 (default) then
+  * parent will (try to) run first.
+@@ -4705,6 +4705,40 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ static int
+ wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se);
+ 
++
++static inline bool coop_entity_inactive(struct sched_entity *se)
++{
++#ifdef CONFIG_FAIR_GROUP_SCHED
++	if (!entity_is_task(se))
++		return false;
++#endif
++
++	return task_of(se)->coop_inactive;
++}
++
++static struct sched_entity *
++pick_first_active_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
++{
++    struct sched_entity *se = __pick_first_entity(cfs_rq);
++    struct sched_entity *best = NULL;
++
++    while (se) {
++        if (!coop_entity_inactive(se)) {
++            best = se;
++            break;
++        }
++
++        se = __pick_next_entity(se);
++    }
++
++    if (curr && !coop_entity_inactive(curr)) {
++        if (!best || entity_before(curr, best))
++            best = curr;
++    }
++
++    return best;
++}
++
+ /*
+  * Pick the next process, keeping these things in mind, in this order:
+  * 1) keep things fair between processes/task groups
+@@ -4757,7 +4791,24 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 		 */
+ 		se = cfs_rq->last;
+ 	}
++	/*
++     * Cooperative scheduling:
++     * If normal CFS picked an inactive task, try to run the active
++     * runnable task with the smallest vruntime instead. However, do not
++     * starve inactive tasks forever. If the inactive task is too far behind in vruntime, let it run.
++    */
++	if (se && coop_entity_inactive(se)) {
++        struct sched_entity *active;
++
++        active = pick_first_active_entity(cfs_rq, curr);
+ 
++        if (active) {
++            s64 vdiff = active->vruntime - se->vruntime;
++
++            if (vdiff <= COOP_STARVE_GRAN_NS)
++                se = active;
++        }
++	}
+ 	return se;
+ }
+ 

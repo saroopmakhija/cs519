@@ -149,8 +149,8 @@ int main(int argc, char const *argv[])
     int shm_bt = shm_create(elems * sizeof(int));
     int shm_c  = shm_create(elems * sizeof(long long));
 
-    int      *A  = (int *)shm_attach(shm_a);
-    int      *BT = (int *)shm_attach(shm_bt);
+    int *A  = (int *)shm_attach(shm_a);
+    int *BT = (int *)shm_attach(shm_bt);
     long long *C = (long long *)shm_attach(shm_c);
 
     init_matrices(A, BT, n);

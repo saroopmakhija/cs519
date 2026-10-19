@@ -1,0 +1,305 @@
+Part A — Understanding the Linux CFS Scheduler
+
+Overview
+
+The Linux scheduler is split between generic scheduler core code and per-class policies. CFS is not a standalone scheduler loop; it is one scheduling class plugged into the generic scheduler. The generic code decides when scheduling happens, locks the current CPU's runqueue, updates common accounting, and calls scheduling-class callbacks. CFS supplies the callbacks for SCHED_NORMAL, SCHED_BATCH, and SCHED_IDLE tasks.
+
+For the default fair scheduler, the key files are:
+
+- kernel/sched/core.c (generic scheduling framework, wakeup, context switch, preemption entry points)
+- kernel/sched/fair.c (CFS policy: enqueue/dequeue/select/preempt/load-balance logic)
+- kernel/sched/sched.h (internal scheduler data structures, especially per-CPU runqueue)
+- include/linux/sched.h and include/linux/sched/prio.h (task-facing scheduler structures and priority/nice definitions)
+- kernel/sched/debug.c, kernel/sched/stats.h, kernel/sched/cputime.c, fs/proc/array.c, and fs/proc/base.c (scheduler statistics and userspace export paths)
+
+1) How are tasks added to a per-CPU runqueue, and which file maintains this information?
+
+Per-CPU runqueue data is maintained by struct rq in kernel/sched/sched.h. Per-CPU instances are the runqueues variable defined in kernel/sched/core.c via DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues).
+
+Main enqueue path:
+- a sleeping task becoming runnable usually enters through the wakeup path (try_to_wake_up() and ttwu_do_activate() in kernel/sched/core.c)
+- a newly forked task enters through wake_up_new_task() in kernel/sched/core.c
+- both paths eventually place the task on a selected CPU's runqueue by calling activate_task(rq, p, flags)
+- activate_task() calls enqueue_task(rq, p, flags), then marks p->on_rq = TASK_ON_RQ_QUEUED
+- enqueue_task() does generic accounting (runqueue clock update, sched_info enqueue accounting, PSI pressure accounting, uclamp enqueue, core-scheduling bookkeeping), then dispatches to:
+  p->sched_class->enqueue_task(rq, p, flags)
+- for normal CFS tasks, this callback is enqueue_task_fair() in kernel/sched/fair.c
+
+Inside CFS enqueue:
+- enqueue_task_fair() walks sched entities (task and possibly parent group entities)
+- enqueue_entity() updates current runtime, normalizes the entity's vruntime, places the entity in the CFS rb-tree, and updates PELT/load state
+- CFS counters are updated (cfs_rq->nr_running, cfs_rq->h_nr_running, idle_h_nr_running)
+- root rq runnable count is updated with add_nr_running(rq, 1)
+- on SMP systems, the fair-class task is also linked on rq->cfs_tasks for load balancing
+
+Files responsible:
+- Data structure: kernel/sched/sched.h (struct rq, struct cfs_rq, counters)
+- Enqueue mechanics: kernel/sched/core.c and kernel/sched/fair.c
+- Priority and CPU-selection policy: kernel/sched/core.c and kernel/sched/fair.c
+
+2) How are tasks scheduled on a CPU, and which functions handle this?
+
+Scheduling on a CPU means selecting the next runnable task and context-switching to it.
+
+Main flow:
+- __schedule() in kernel/sched/core.c is the central scheduler function
+- it obtains the current CPU's rq, updates rq clocks, classifies the previous task as voluntary or preempted, and optionally deactivates prev if it is sleeping
+- it calls pick_next_task(rq, prev, &rf)
+- class ordering is stop > dl > rt > fair > idle
+- for fair-class tasks, selection is handled by pick_next_task_fair() in kernel/sched/fair.c
+- switch happens through context_switch()
+
+CFS selection model:
+- CFS keeps runnable entities in cfs_rq->tasks_timeline, a cached red-black tree ordered by vruntime
+- task with smallest vruntime (leftmost entity) is preferred
+- pick_next_entity() chooses the leftmost entity, with limited influence from next/last/skip buddy hints
+- put_prev_task_fair() updates the previous entity's runtime and requeues previous task state as needed
+- set_next_task_fair() marks chosen entity as current
+
+Key functions:
+- kernel/sched/core.c: __schedule(), pick_next_task(), context_switch()
+- kernel/sched/fair.c: pick_next_task_fair(), pick_next_entity(), put_prev_task_fair(), set_next_task_fair()
+
+3) How are tasks descheduled or preempted from a CPU?
+
+A task stops running either voluntarily (sleep/block/yield) or involuntarily (preemption).
+
+A) Voluntary deschedule:
+- task blocks (mutex/waitqueue/io_schedule) or calls schedule()/yield
+- __schedule() sees non-running state, treats the switch as voluntary, increments prev->nvcsw, and calls deactivate_task(rq, prev, DEQUEUE_SLEEP | ...)
+- deactivate_task() calls class dequeue callback
+- for CFS: dequeue_task_fair(), which removes entity and updates hierarchy/counters
+- root runnable count decremented with sub_nr_running(rq, 1)
+- if the task remains runnable but loses the CPU because of preemption, it is not removed as sleeping; instead put_prev_task_fair() updates its runtime and leaves/requeues it as runnable
+
+B) Preemption:
+- resched_curr(rq) sets need_resched flags (local or remote IPI on SMP)
+- actual switch occurs at safe preemption points (interrupt/user return, preempt-enable boundary, explicit schedule)
+
+Main preemption triggers:
+1. Wakeup preemption:
+   - wakeup path calls check_preempt_curr(rq, p, flags)
+   - CFS case handled by check_preempt_wakeup() in fair.c
+   - compares waking vs current entity; may call resched_curr(rq)
+
+2. Tick preemption:
+   - scheduler_tick() in core.c calls curr->sched_class->task_tick(...)
+   - CFS path: task_tick_fair() -> entity_tick() -> check_preempt_tick()
+   - if current exceeded ideal slice or fairness gap too large, resched_curr(rq)
+
+3. Priority/class changes:
+   - prio/class changes invoke class prio_changed() and can request reschedule
+
+4. Explicit reschedule/yield:
+   - yield paths call class yield_task() callbacks and then schedule again
+   - CFS yield can set skip hints so the yielding entity is not immediately chosen again
+
+4) How are runqueues rebalanced across CPUs?
+
+Rebalancing is domain-based and mostly implemented in kernel/sched/fair.c.
+
+Trigger path:
+- scheduler_tick() (core.c) calls trigger_load_balance(rq)
+- when due, raises SCHED_SOFTIRQ
+- run_rebalance_domains() executes in softirq context
+- run_rebalance_domains() calls rebalance_domains(rq, idle_state)
+
+Domain walk:
+- rebalance_domains() iterates sched_domain hierarchy for current CPU
+- at each domain interval, it calls load_balance(cpu, rq, sd, idle, ...)
+
+Load-balance algorithm:
+1. Build lb_env (source/destination, domain, imbalance target)
+2. update_sd_lb_stats() gathers per-domain and per-group load/utilization/capacity data
+3. find_busiest_group(&env)
+4. find_busiest_queue(&env, group)
+5. calculate_imbalance() chooses migration_type:
+   - migrate_load / migrate_util / migrate_task / migrate_misfit
+6. detach_tasks(&env) from busiest rq
+7. attach_tasks(&env) to destination rq
+
+Migration constraints:
+- can_migrate_task() rejects moves due to affinity, per-cpu kthreads, running tasks,
+  cache-hot/locality concerns, throttled hierarchies, etc.
+- if passive balancing fails repeatedly, active_load_balance_cpu_stop() (stopper thread)
+  can force migration of one task.
+
+Special paths:
+- sched_balance_newidle() when CPU is becoming idle (pull work quickly)
+- NOHZ balancing for tickless idle CPUs (housekeeping CPU balances on their behalf)
+- wakeup CPU selection via select_task_rq_fair() can avoid later balancing by placing a waking task on a better CPU immediately
+
+5) What data structures are used to manage runqueues?
+
+Top-level per-CPU:
+- struct rq (kernel/sched/sched.h)
+  - lock, nr_running, curr/idle/stop pointers
+  - class sub-runqueues: cfs, rt, dl
+  - rq clock state, nr_switches, load-balancing fields, CPU capacity, uclamp state, and sched_domain hooks
+
+CFS:
+- struct cfs_rq
+  - tasks_timeline: rb_root_cached (ordered by vruntime)
+  - curr/next/last/skip entity pointers
+  - nr_running and hierarchical runnable counters
+  - PELT averages, group-scheduling and bandwidth-throttle fields
+
+RT:
+- struct rt_rq
+  - rt_prio_array active + per-priority queues/bitmap
+  - rt_nr_running and RT-specific push/throttle fields
+
+Deadline:
+- struct dl_rq
+  - rb_root_cached root ordered by absolute deadline
+  - dl_nr_running and deadline bandwidth state
+
+Per-task entities:
+- struct sched_entity (CFS): includes rb_node run_node
+  - load weight, exec_start, sum_exec_runtime, vruntime, prev_sum_exec_runtime, nr_migrations, and PELT average
+- struct sched_rt_entity (RT): list/run queue linkage
+- struct sched_dl_entity (DL): rb_node and deadline parameters
+- struct task_struct embeds all of these policy-specific entities and points at its active sched_class
+
+6) How does the scheduler convert application-specified nice values to priorities?
+
+Defined in include/linux/sched/prio.h:
+
+- NICE_TO_PRIO(nice) = nice + DEFAULT_PRIO
+- PRIO_TO_NICE(prio) = prio - DEFAULT_PRIO
+- MAX_RT_PRIO = 100
+- DEFAULT_PRIO = 120
+- so nice range [-20..19] maps to static priority [100..139] for fair class
+
+Interpretation:
+- smaller numeric prio means higher scheduler priority
+
+Runtime path:
+- set_user_nice() in kernel/sched/core.c validates bounds
+- sets p->static_prio = NICE_TO_PRIO(nice)
+- updates CFS weight with set_load_weight() using sched_prio_to_weight[]
+- recomputes p->prio = effective_prio(p)
+- requeues/reschedules if necessary
+
+Weight mapping:
+- sched_prio_to_weight[40] in kernel/sched/core.c maps nice values to CFS weights
+- each +1 nice step is roughly 10% less weight, so a lower nice value gets proportionally more CPU time under contention
+- CFS fairness is therefore mostly weight-based, not fixed timeslice priority-based
+
+Note:
+- For RT/DL policies, nice can be stored as static_prio but does not drive scheduling
+  until task returns to fair class.
+
+7) How are per-task and per-process statistics collected by the scheduler?
+
+Per-task runtime/accounting:
+- sum_exec_runtime updated in each class update_curr path:
+  - fair.c update_curr()
+  - rt.c update_curr_rt()
+  - deadline.c update_curr_dl()
+- for CFS, update_curr() computes delta_exec from rq_clock_task(), adds it to curr->sum_exec_runtime and cfs_rq->exec_clock, then advances curr->vruntime using calc_delta_fair()
+- user/system/guest time fields updated in kernel/sched/cputime.c:
+  account_user_time(), account_system_time(), account_guest_time()
+- context switches:
+  - nvcsw (voluntary) and nivcsw (involuntary) updated in __schedule()
+
+Schedstats (if CONFIG_SCHEDSTATS):
+- struct sched_statistics in include/linux/sched.h
+- updated by CFS enqueue/dequeue and wait/sleep/block transitions:
+  update_stats_wait_start/end(), update_stats_enqueue_sleeper(), etc.
+- includes wait time, sleep/block time, max execution slice, migrations, and wakeup counters
+
+Sched_info (if CONFIG_SCHED_INFO):
+- run_delay / enqueue-arrival-depart timestamps updated in kernel/sched/stats.h:
+  sched_info_enqueue(), sched_info_dequeue(), sched_info_switch()
+- this records how long runnable tasks waited before actually running
+
+Per-process (thread-group) aggregation:
+- signal_struct holds accumulated group totals
+- on thread exit, __exit_signal() (kernel/exit.c) folds per-thread totals into:
+  sig->utime, sig->stime, sig->nvcsw, sig->nivcsw, sig->sum_sched_runtime, etc.
+- thread_group_cputime() combines dead-thread totals + live thread totals for queries
+
+8) How are these statistics exposed to userspace?
+
+/proc per-task/process interfaces:
+- /proc/<pid>/stat, /proc/<tid>/stat
+  - cpu times, faults, priority/nice, thread count, etc. (fs/proc/array.c)
+- /proc/<pid>/status, /proc/<tid>/status
+  - includes voluntary/nonvoluntary context switch counters
+- /proc/<pid>/task/<tid>/status exposes the same kind of counters for individual threads
+- /proc/<pid>/sched (CONFIG_SCHED_DEBUG)
+  - detailed scheduler internals via proc_sched_show_task()
+- /proc/<pid>/schedstat (CONFIG_SCHED_INFO)
+  - exports sum_exec_runtime, run_delay, pcount
+
+System-wide:
+- /proc/stat
+  - global/per-CPU cpustat buckets (user/nice/system/idle/iowait/irq/...)
+- /proc/schedstat
+  - runqueue/domain balancing and delay metrics (kernel/sched/stats.c)
+
+Cgroups:
+- cgroup v2 cpu.stat
+  - usage_usec, user_usec, system_usec
+  - printed by cgroup_base_stat_cputime_show()
+
+Tracing:
+- scheduler tracepoints (sched_switch, sched_wakeup, sched_stat_*, etc.)
+  - consumed via ftrace/perf/eBPF
+
+CFS idleness mismatch / underutilization scenarios
+
+CFS can appear to miss application idleness, or a CPU core can be underutilized even while the application as a whole is not making progress, in these cases:
+
+1. Blocking-dominated applications
+   - Threads spend time in I/O waits, lock waits, futex waits.
+   - They are not runnable, so CFS cannot schedule them even if core is idle.
+   - From CFS's point of view, this is not lost runnable work; it is a lack of runnable entities.
+
+2. Cgroup CFS bandwidth throttling
+   - Runnable tasks can be prevented from running due to quota exhaustion.
+   - Core may be idle while app still has pending work but no runtime budget.
+
+3. Affinity/cpuset restrictions
+   - Tasks constrained to a subset of CPUs.
+   - Idle CPUs outside allowed mask cannot be used.
+
+4. PELT/util-estimation lag and phase changes
+   - Utilization signals are decayed/averaged.
+   - Bursty apps can have transient misestimation, affecting placement/frequency
+     and temporarily reducing effective throughput.
+   - A short burst after a long idle phase may initially look small to the load tracker.
+
+5. Cache-hot/locality migration heuristics
+   - Balancer may avoid migration to protect locality.
+   - This can preserve cache performance but delay load spread.
+
+6. NOHZ/timing effects
+   - Tickless idle balancing is delegated and periodic updates are less frequent.
+   - Transient imbalance can persist slightly longer before correction.
+
+7. Wakeup/preemption granularity
+   - Tasks may wait until next preemption point or granularity threshold.
+   - Very short bursts can leave brief underutilization windows.
+
+8. Insufficient application parallelism
+   - If the application has one runnable thread and many idle CPUs, CFS cannot parallelize that work.
+   - This is common in single-threaded phases, serial bottlenecks, and dependency chains.
+
+9. External bottlenecks
+   - The application may be limited by storage, network, memory bandwidth, page faults, or device interrupts.
+   - CPU idleness is then a symptom of waiting outside the scheduler's runnable-task model.
+
+Conclusion
+
+CFS behavior is split between:
+- generic scheduler mechanics in core.c,
+- fair policy in fair.c,
+- data structures in sched.h,
+- accounting in cputime/stats/exit/proc/cgroup paths.
+
+Task lifecycle and statistics are tightly integrated: enqueue/dequeue/switch/update_curr
+paths both decide execution and continuously account runtime, latency, wait time,
+migrations, and balancing data. Those values are then exported through procfs,
+cgroup files, schedstat/debug files, and tracepoints.

@@ -1,0 +1,79 @@
+diff --git a/linux-5.15.0/kernel/sched/fair.c b/linux-5.15.0/kernel/sched/fair.c
+index 3a35bd128..4f3e27cbe 100644
+--- a/linux-5.15.0/kernel/sched/fair.c
++++ b/linux-5.15.0/kernel/sched/fair.c
+@@ -63,7 +63,7 @@ static unsigned int normalized_sysctl_sched_min_granularity	= 750000ULL;
+  * This value is kept at sysctl_sched_latency/sysctl_sched_min_granularity
+  */
+ static unsigned int sched_nr_latency = 8;
+-
++#define COOP_STARVE_GRAN_NS 50000000LL /* 50 ms */ 
+ /*
+  * After fork, child runs first. If set to 0 (default) then
+  * parent will (try to) run first.
+@@ -4705,6 +4705,40 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ static int
+ wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se);
+ 
++
++static inline bool coop_entity_inactive(struct sched_entity *se)
++{
++#ifdef CONFIG_FAIR_GROUP_SCHED
++	if (!entity_is_task(se))
++		return false;
++#endif
++
++	return task_of(se)->coop_inactive;
++}
++
++static struct sched_entity *
++pick_first_active_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
++{
++    struct sched_entity *se = __pick_first_entity(cfs_rq);
++    struct sched_entity *best = NULL;
++
++    while (se) {
++        if (!coop_entity_inactive(se)) {
++            best = se;
++            break;
++        }
++
++        se = __pick_next_entity(se);
++    }
++
++    if (curr && !coop_entity_inactive(curr)) {
++        if (!best || entity_before(curr, best))
++            best = curr;
++    }
++
++    return best;
++}
++
+ /*
+  * Pick the next process, keeping these things in mind, in this order:
+  * 1) keep things fair between processes/task groups
+@@ -4757,7 +4791,24 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 		 */
+ 		se = cfs_rq->last;
+ 	}
++	/*
++     * Cooperative scheduling:
++     * If normal CFS picked an inactive task, try to run the active
++     * runnable task with the smallest vruntime instead. However, do not
++     * starve inactive tasks forever. If the inactive task is too far behind in vruntime, let it run.
++    */
++	if (se && coop_entity_inactive(se)) {
++        struct sched_entity *active;
++
++        active = pick_first_active_entity(cfs_rq, curr);
+ 
++        if (active) {
++            s64 vdiff = active->vruntime - se->vruntime;
++
++            if (vdiff <= COOP_STARVE_GRAN_NS)
++                se = active;
++        }
++	}
+ 	return se;
+ }
+ 
