@@ -1,0 +1,13 @@
+--- linux-5.15.0-clean/kernel/fork.c	2026-04-19 17:22:29.000000000 -0600
++++ linux-5.15.0/kernel/fork.c	2026-04-13 17:43:26.836462222 -0600
+@@ -1089,6 +1089,10 @@
+ 		mm->flags = default_dump_filter;
+ 		mm->def_flags = 0;
+ 	}
++	mm->extent_tree = RB_ROOT;
++    spin_lock_init(&mm->extent_lock);
++    mm->next_extent_id = 0;
++    mm->extent_count = 0;
+ 
+ 	if (mm_alloc_pgd(mm))
+ 		goto fail_nopgd;

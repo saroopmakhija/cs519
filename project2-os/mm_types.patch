@@ -1,0 +1,36 @@
+--- linux-5.15.0-clean/include/linux/mm_types.h	2026-04-19 17:22:29.000000000 -0600
++++ linux-5.15.0/include/linux/mm_types.h	2026-04-13 16:52:53.209248659 -0600
+@@ -587,11 +587,32 @@
+ #endif
+ 	} __randomize_layout;
+ 
++	struct rb_root extent_tree;
++	spinlock_t extent_lock;
++	unsigned long next_extent_id;
++	unsigned long extent_count;
+ 	/*
+ 	 * The mm_cpumask needs to be at the end of mm_struct, because it
+ 	 * is dynamically sized based on nr_cpu_ids.
+ 	 */diff -u linux-5.15.0-clean/kernel/fork.c             linux-5.15.0/kernel/fork.c             > extent_patches/02_fork.patch
+
+ 	unsigned long cpu_bitmap[];
++
++	
++};
++
++
++struct extent_page {
++    phys_addr_t phys_addr;
++    struct list_head list;
++};
++
++struct extent {
++    phys_addr_t start_addr;
++    phys_addr_t end_addr;
++    unsigned long num_pages;
++    unsigned long extent_id;
++    struct list_head page_list;
++    struct rb_node rb_node;
+ };
+ 
+ extern struct mm_struct init_mm;
